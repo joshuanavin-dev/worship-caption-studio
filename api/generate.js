@@ -58,32 +58,44 @@ Return ONLY valid JSON matching this exact structure:
   "shareWorthy": "Explain which 1-2 option numbers are most share-worthy and why."
 }`;
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-          },
-        }),
+    // Try primary model first, automatically fall back if experiencing high demand (503/429)
+    const models = ['gemini-3.8-flash', 'gemini-3.8-flash-lite'];
+    let lastError = 'Gemini API error';
+
+    for (const model of models) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              responseMimeType: 'application/json',
+            },
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (response.ok) {
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        const parsed = JSON.parse(rawText);
+        return res.status(200).json(parsed);
       }
-    );
 
-    const data = await response.json();
+      lastError = data.error?.message || lastError;
 
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: data.error?.message || 'Gemini API error',
-      });
+      // Only retry with fallback model on temporary overload (503) or rate limit (429)
+      if (response.status !== 503 && response.status !== 429) {
+        return res.status(response.status).json({ error: lastError });
+      }
     }
 
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    const parsed = JSON.parse(rawText);
-
-    return res.status(200).json(parsed);
+    return res.status(503).json({
+      error: 'Both models are momentarily busy. Please wait 5 seconds and tap Generate again.',
+    });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to generate captions.' });
   }
