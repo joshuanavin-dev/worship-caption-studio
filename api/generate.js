@@ -1,3 +1,5 @@
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -58,13 +60,10 @@ Return ONLY valid JSON matching this exact structure:
   "shareWorthy": "Explain which 1-2 option numbers are most share-worthy and why."
 }`;
 
-    // Try primary model first, automatically fall back if experiencing high demand (503/429)
-    const models = ['gemini-3.8-flash', 'gemini-3.8-flash-lite'];
-    let lastError = 'Gemini API error';
-
-    for (const model of models) {
+    const callGemini = async (modelName) => {
+      const cleanName = modelName.replace(/^models\//, '');
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${cleanName}:generateContent?key=${apiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -76,25 +75,58 @@ Return ONLY valid JSON matching this exact structure:
           }),
         }
       );
-
       const data = await response.json();
+      return { ok: response.ok, status: response.status, data };
+    };
 
-      if (response.ok) {
-        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        const parsed = JSON.parse(rawText);
-        return res.status(200).json(parsed);
+    // 1. Try gemini-3.8-flash up to 3 times with short backoff for transient 503 spikes
+    let lastError = 'Gemini API error';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await callGemini('gemini-3.8-flash');
+      if (result.ok) {
+        const rawText = result.data.candidates?.[0]?.content?.parts?.[0]?.text;
+        return res.status(200).json(JSON.parse(rawText));
       }
 
-      lastError = data.error?.message || lastError;
+      lastError = result.data.error?.message || lastError;
 
-      // Only retry with fallback model on temporary overload (503) or rate limit (429)
-      if (response.status !== 503 && response.status !== 429) {
-        return res.status(response.status).json({ error: lastError });
+      // Stop immediately on auth or bad request errors
+      if (result.status !== 503 && result.status !== 429) {
+        return res.status(result.status).json({ error: lastError });
+      }
+
+      if (attempt < 2) {
+        await sleep(1500 * (attempt + 1));
+      }
+    }
+
+    // 2. If still busy, ask Google which Flash models are active on this key and try them
+    const listRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+    );
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      const backupModels = (listData.models || [])
+        .filter(
+          (m) =>
+            m.supportedGenerationMethods?.includes('generateContent') &&
+            m.name.includes('flash') &&
+            !m.name.includes('gemini-3.8-flash') &&
+            !m.name.includes('2.5-flash')
+        )
+        .map((m) => m.name);
+
+      for (const backup of backupModels) {
+        const result = await callGemini(backup);
+        if (result.ok) {
+          const rawText = result.data.candidates?.[0]?.content?.parts?.[0]?.text;
+          return res.status(200).json(JSON.parse(rawText));
+        }
       }
     }
 
     return res.status(503).json({
-      error: 'Both models are momentarily busy. Please wait 5 seconds and tap Generate again.',
+      error: 'Google AI is temporarily busy. Please wait 5 seconds and click Generate again.',
     });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to generate captions.' });
